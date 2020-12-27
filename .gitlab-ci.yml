@@ -1,0 +1,115 @@
+workflow:
+  rules:
+    - if: $CI_MERGE_REQUEST_ID               # Execute jobs in merge request context
+    - if: $CI_COMMIT_BRANCH == 'dev' || $CI_COMMIT_BRANCH == 'release' || $CI_COMMIT_BRANCH == 'master' || $CI_COMMIT_BRANCH == 'enterprise'
+
+stages:
+  - preparation
+  - building
+  - auto-review
+
+image: edbizarro/gitlab-ci-pipeline-php:7.3
+
+# Variables
+variables:
+  MYSQL_ROOT_PASSWORD: root
+  MYSQL_USER: test_ci
+  MYSQL_PASSWORD: test_ci_secret
+  MYSQL_DATABASE: test_ci
+  DB_HOST: mysql
+
+cache:
+  key: "$CI_JOB_STAGE-$CI_COMMIT_REF_SLUG"
+
+composer:
+  stage: preparation
+  services:
+    - redis:latest
+  script:
+    - php -v
+    - composer install --prefer-dist --no-ansi --no-interaction --no-progress --no-scripts
+    - cp .env.example .env
+    - cp config.yml.example config.yml
+  artifacts:
+    paths:
+      - vendor/
+      - .env
+    expire_in: 1 days
+    when: always
+  cache:
+    paths:
+      - vendor/
+
+npm:
+  stage: preparation
+  script:
+    - npm --version
+    - npm ci
+  artifacts:
+    paths:
+      - node_modules/
+    expire_in: 1 days
+    when: always
+  cache:
+    paths:
+      - node_modules/
+
+build-assets:
+  stage: building
+  # Download the artifacts for these jobs
+  dependencies:
+    - composer
+    - npm
+  script:
+    - npm --version
+    - npm run production --progress false
+  artifacts:
+    paths:
+      - public/css/
+      - public/js/
+      - public/fonts/
+      - public/mix-manifest.json
+    expire_in: 1 days
+    when: always
+
+db-seeding:
+  stage: building
+  services:
+    - redis:latest
+    - name: mysql:5.7
+      command: ["--default-authentication-plugin=mysql_native_password"]
+  # Download the artifacts for these jobs
+  dependencies:
+    - composer
+    - npm
+  script:
+    - mysql --version
+    - echo "SELECT 'OK';" | mysql --host="${DB_HOST}" --user="${MYSQL_USER}" --password="${MYSQL_PASSWORD}" "$MYSQL_DATABASE"
+    - cp .env.example .env
+    - cp config.yml.example config.yml
+    - php artisan migrate:fresh --seed
+    - php artisan key:generate
+    - mysqldump --host="${DB_HOST}" --user="${MYSQL_USER}" --password="${MYSQL_PASSWORD}" "${MYSQL_DATABASE}" > db.sql
+  artifacts:
+    paths:
+      - storage/logs # for debugging
+      - db.sql
+    expire_in: 1 days
+    when: always
+
+codestyle:
+  stage: auto-review
+  image: lorisleiva/laravel-docker
+  script:
+    - phpcs --standard=PSR12 --ignore=*/app/Libraries/* --extensions=php app
+  dependencies: []
+
+phpcpd:
+  stage: auto-review
+  script:
+    - test -f phpcpd.phar || curl -L https://phar.phpunit.de/phpcpd.phar -o phpcpd.phar
+    - php phpcpd.phar app/ --min-lines=42 --exclude=app/Libraries/
+  dependencies: []
+  cache:
+    paths:
+      - phpcpd.phar
